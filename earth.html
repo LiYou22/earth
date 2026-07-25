@@ -9,11 +9,12 @@
   canvas { display: block; }
   #hud, #load {
     position: fixed;
-    font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
     color: #7f8c9b; user-select: none; pointer-events: none;
   }
   #hud { left: 16px; bottom: 14px; }
   #hud b { color: #cfd8e3; font-weight: 500; }
+  #hud i { color: #e8a33d; font-style: normal; }
   #load { left: 50%; top: 50%; transform: translate(-50%, -50%); color: #46525f; }
 </style>
 </head>
@@ -21,7 +22,9 @@
 <div id="load">loading textures…</div>
 <div id="hud">
   drag <b>orbit</b> · scroll <b>zoom</b> · <b>space</b> pause · <b>[ ]</b> time scale · <b>c</b> clouds<br>
-  time <b id="rate">1×</b> · sun lon <b id="sun">0°</b>
+  <b>1</b> earth · <b>2</b> earth–moon · <b>3</b> follow moon · <b>t</b> now · url <b>#2027-08-02T10:07</b><br>
+  <b id="date">—</b> UTC · <b id="rate">1×</b><br>
+  moon <b id="phase">—</b> · <b id="dist">—</b><span id="ecl"></span>
 </div>
 
 <script type="importmap">
@@ -37,35 +40,73 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-const AXIAL_TILT = 23.44 * Math.PI / 180;
-const DAY = 86400;
-const YEAR = 365.256 * DAY;
-const TAU = Math.PI * 2;
+// Everything is in earth radii (6371 km) and seconds. The scene frame is the
+// J2000 ecliptic: +Y is ecliptic north, +X points at the vernal equinox, and
+// ecliptic longitude increases as a positive rotation about +Y.
+const RE_KM      = 6371.0;
+const AXIAL_TILT = 23.4393 * Math.PI / 180;
+const DAY        = 86400;              // mean solar day
+const SIDEREAL   = 86164.0905;         // one rotation w.r.t. the stars
+const TAU        = Math.PI * 2;
+const DEG        = Math.PI / 180;
+
+const R_MOON = 0.27245;                // lunar radius, earth radii
+const A_MOON = 60.334;                 // semi-major axis, earth radii
+const E_MOON = 0.0549;
+const I_MOON = 5.145 * DEG;
+
+// The real sun is 23,481 earth radii away, which no depth buffer will tolerate
+// alongside a unit-radius planet. It is drawn much closer with its radius cut
+// by the same factor, so its angular size — and therefore every shadow cone in
+// the system — stays correct.
+const SUN_DIST  = 3000;
+const SUN_RATIO = 0.0046524;           // solar radius / 1 AU
+const SUN_R     = SUN_DIST * SUN_RATIO;
+
+const J2000_MS = Date.UTC(2000, 0, 1, 12, 0, 0);
+
+// #2027-08-02T10:07 jumps the clock there; no fragment means right now.
+const startMs = () => {
+  const h = decodeURIComponent(location.hash.slice(1));
+  const ms = h ? Date.parse(/[Zz+]|T.*-/.test(h) ? h : h + 'Z') : NaN;
+  return Number.isNaN(ms) ? Date.now() : ms;
+};
+// A #timestamp means the user asked for a specific moment, so hold there
+// rather than drifting away from it while they look.
+const state = { t: (startMs() - J2000_MS) / 1000, rate: 3600, ready: false,
+                paused: location.hash.length > 1, focus: 'earth' };
+const clock = new THREE.Clock();
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
-renderer.toneMapping = THREE.NeutralToneMapping;   // keeps ocean/land saturation
+renderer.toneMapping = THREE.NeutralToneMapping;
 renderer.toneMappingExposure = 1.0;
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.01, 2000);
+const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.02, 40000);
 camera.position.set(2.3, 0.9, 2.5);
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.06;
 controls.minDistance = 1.05;
-controls.maxDistance = 40;
+controls.maxDistance = 900;
 controls.rotateSpeed = 0.4;
 controls.zoomSpeed = 0.7;
 
 // ── textures ──────────────────────────────────────────────────────────────
-// All hosts below send `access-control-allow-origin: *`, which WebGL requires
-// even when this page is opened straight off disk.
-const manager = new THREE.LoadingManager(() => document.getElementById('load').remove());
+// All hosts below send an allow-all CORS header, which WebGL requires even
+// when this page is opened straight off disk.
+const manager = new THREE.LoadingManager(() => {
+  document.getElementById('load').remove();
+  // Hold the clock until the textures are in, or a #timestamp in the url lands
+  // however many minutes of loading later.
+  state.ready = true;
+  clock.getDelta();
+});
 const loader = new THREE.TextureLoader(manager);
 const aniso = renderer.capabilities.getMaxAnisotropy();
 const load = (url, colorSpace = THREE.NoColorSpace) => {
@@ -75,18 +116,26 @@ const load = (url, colorSpace = THREE.NoColorSpace) => {
   t.wrapS = THREE.RepeatWrapping;
   return t;
 };
-const GLOBE = 'https://cdn.jsdelivr.net/npm/three-globe/example/img/';
+const GLOBE  = 'https://cdn.jsdelivr.net/npm/three-globe/example/img/';
 const TURBAN = 'https://raw.githubusercontent.com/turban/webgl-earth/master/images/';
+const PLANET = 'https://raw.githubusercontent.com/jeromeetienne/threex.planets/master/images/';
+const THREEJS = 'https://threejs.org/examples/textures/planets/';
 
 const dayMap   = load(GLOBE + 'earth-blue-marble.jpg', THREE.SRGBColorSpace); // 4096²  NASA albedo
-const nightMap = load(GLOBE + 'earth-night.jpg', THREE.SRGBColorSpace);       // 4096²  city lights
+// three-globe's earth-night is a stylised map with a blue wash over every
+// continent; this one is the real black marble, so the dark side stays dark.
+const nightMap = load(THREEJS + 'earth_lights_2048.png', THREE.SRGBColorSpace);
 const waterMap = load(TURBAN + 'water_4k.png');                               // 4096²  white = ocean
-const elevMap  = load(TURBAN + 'elev_bump_4k.jpg');                           // 4096²  elevation + bathymetry
+const elevMap  = load(TURBAN + 'elev_bump_4k.jpg');                           // 4096²  elevation
 const cloudMap = load(TURBAN + 'fair_clouds_4k.png', THREE.SRGBColorSpace);   // 4096²  alpha = coverage
+const moonMap  = load(PLANET + 'moonmap1k.jpg', THREE.SRGBColorSpace);
+const moonBump = load(PLANET + 'moonbump1k.jpg');
 
-// Shared animation clocks. cloudT is in simulated days; waveT is a separate,
-// rate-limited clock so swell does not strobe when the sim runs at days/second.
-const sunDir   = new THREE.Vector3(1, 0, 0);
+// ── shared uniforms ───────────────────────────────────────────────────────
+const sunDir   = new THREE.Vector3(1, 0, 0);   // unit, earth → sun
+const sunPos   = { value: new THREE.Vector3() };
+const moonPos  = { value: new THREE.Vector3() };
+const sunTrueR = { value: SUN_R };             // radius matching sunPos
 const cloudT   = { value: 0 };
 const waveT    = { value: 0 };
 const waveFade = { value: 1 };
@@ -108,6 +157,18 @@ const COMMON = /* glsl */`
     float a = rough * rough, a2 = a * a;
     float d = NoH * NoH * (a2 - 1.0) + 1.0;
     return a2 / (3.14159265 * d * d);
+  }
+
+  // Fraction of the sun's disc hidden behind a sphere, seen from point p.
+  // Angular radii are compared directly, so this covers partial, total and
+  // annular alike — which is the whole of eclipse geometry.
+  float occult(vec3 p, vec3 sunP, float sunR, vec3 occP, float occR) {
+    vec3 ts = sunP - p, to = occP - p;
+    float sep = acos(clamp(dot(normalize(ts), normalize(to)), -1.0, 1.0));
+    float rs = asin(clamp(sunR / length(ts), 0.0, 1.0));
+    float ro = asin(clamp(occR / length(to), 0.0, 1.0));
+    float cov = 1.0 - smoothstep(abs(ro - rs), ro + rs, sep);
+    return cov * min(1.0, (ro * ro) / (rs * rs + 1e-9));
   }
 
   // ── animated cloud field ────────────────────────────────────────────────
@@ -141,7 +202,7 @@ const COMMON = /* glsl */`
 
 const VERT = /* glsl */`
   varying vec2 vUv;
-  varying vec3 vN, vT, vB, vView;
+  varying vec3 vN, vT, vB, vView, vWorld, vNW;
   void main() {
     vUv = uv;
     // Equirect UVs run around +Y, so d(pos)/du is analytic — no tangent attribute.
@@ -150,6 +211,8 @@ const VERT = /* glsl */`
     vN = normalize(normalMatrix * normal);
     vT = normalize(normalMatrix * t);
     vB = cross(vN, vT);                 // points north
+    vNW = normalize(mat3(modelMatrix) * normal);
+    vWorld = (modelMatrix * vec4(position, 1.0)).xyz;
     vec4 mv = modelViewMatrix * vec4(position, 1.0);
     vView = -mv.xyz;
     gl_Position = projectionMatrix * mv;
@@ -159,21 +222,24 @@ const VERT = /* glsl */`
 // Land and ocean are shaded as different materials, split by the water mask:
 // land is rough Lambert lit through a relief normal derived from the elevation
 // map; ocean is a low-albedo dielectric with animated swell, Fresnel sky
-// reflection and a GGX sun glint. Cloud shadow and limb haze go on top.
+// reflection and a GGX sun glint. Cloud shadow, the moon's shadow and limb
+// haze go on top.
 const earthMat = new THREE.ShaderMaterial({
   uniforms: {
     dayMap: { value: dayMap }, nightMap: { value: nightMap },
     waterMap: { value: waterMap }, elevMap: { value: elevMap },
     cloudMap: { value: cloudMap },
-    sunDir: { value: sunDir }, cloudT, waveT, waveFade, cloudOn,
+    sunDir: { value: sunDir }, sunPos, sunTrueR, moonPos,
+    moonR: { value: R_MOON },
+    cloudT, waveT, waveFade, cloudOn,
   },
   vertexShader: VERT,
   fragmentShader: COMMON + /* glsl */`
     uniform sampler2D dayMap, nightMap, waterMap, elevMap, cloudMap;
-    uniform vec3 sunDir;
-    uniform float cloudT, waveT, waveFade, cloudOn;
+    uniform vec3 sunDir, sunPos, moonPos;
+    uniform float sunTrueR, moonR, cloudT, waveT, waveFade, cloudOn;
     varying vec2 vUv;
-    varying vec3 vN, vT, vB, vView;
+    varying vec3 vN, vT, vB, vView, vWorld, vNW;
 
     const vec3 SUN  = vec3(1.0, 0.97, 0.92);
     const vec3 SKY  = vec3(0.20, 0.40, 0.85);
@@ -212,7 +278,10 @@ const earthMat = new THREE.ShaderMaterial({
       float limb = smoothstep(-0.05, 0.09, geo);       // soft terminator
       float NoL  = max(dot(Nb, L), 0.0);
       float NoV  = max(dot(N, V), 0.0);
-      float lit  = NoL * limb;
+
+      // Solar eclipse: the moon's shadow, umbra and penumbra alike.
+      float sunlight = 1.0 - 0.985 * occult(vWorld, sunPos, sunTrueR, moonPos, moonR);
+      float lit = NoL * limb * sunlight;
 
       float cover = cloudCover(cloudMap, vUv, cloudT) * cloudOn;
       float cshadow = 1.0 - cloudOn * 0.5 *
@@ -242,8 +311,8 @@ const earthMat = new THREE.ShaderMaterial({
       float glint = ggx(NoH, chop) * fres / (4.0 * NoV + 0.05);
 
       vec3 oceanCol = wAlb * lit * cshadow
-                    + SUN * min(glint * NoL * limb, 6.0) * 0.9
-                    + SKY * fres * (0.05 + 0.55 * limb);
+                    + SUN * min(glint * NoL * limb * sunlight, 6.0) * 0.9
+                    + SKY * fres * (0.05 + 0.55 * limb * sunlight);
 
       vec3 color = mix(landCol, oceanCol, water);
 
@@ -251,12 +320,13 @@ const earthMat = new THREE.ShaderMaterial({
       // the limb, and reddened where that column is grazing the terminator.
       float haze = pow(1.0 - NoV, 3.0);
       float dusk = exp(-geo * geo / 0.010);
-      color += mix(SKY, DUSK, dusk * 0.85) * haze * limb * 0.55;
+      color += mix(SKY, DUSK, dusk * 0.85) * haze * limb * sunlight * 0.55;
       color += DUSK * dusk * limb * 0.05 * (0.3 + 0.7 * water);
 
       // ── night side ──
       float night = smoothstep(0.10, -0.14, geo);
-      color += texture2D(nightMap, vUv).rgb * night * 1.35 * (1.0 - cover * 0.65);
+      vec3 lights = max(texture2D(nightMap, vUv).rgb - 0.045, 0.0) * 1.6;
+      color += lights * night * (1.0 - cover * 0.65);
       color += albedo * 0.012 * night;                   // earthshine
 
       gl_FragColor = vec4(color, 1.0);
@@ -270,27 +340,31 @@ const earth = new THREE.Mesh(new THREE.SphereGeometry(1, 256, 128), earthMat);
 const clouds = new THREE.Mesh(
   new THREE.SphereGeometry(1.004, 160, 80),
   new THREE.ShaderMaterial({
-    uniforms: { cloudMap: { value: cloudMap }, sunDir: { value: sunDir }, cloudT },
+    uniforms: {
+      cloudMap: { value: cloudMap }, sunDir: { value: sunDir },
+      sunPos, sunTrueR, moonPos, moonR: { value: R_MOON }, cloudT,
+    },
     transparent: true,
     depthWrite: false,
     vertexShader: VERT,
     fragmentShader: COMMON + /* glsl */`
       uniform sampler2D cloudMap;
-      uniform vec3 sunDir;
-      uniform float cloudT;
+      uniform vec3 sunDir, sunPos, moonPos;
+      uniform float sunTrueR, moonR, cloudT;
       varying vec2 vUv;
-      varying vec3 vN, vT, vB, vView;
+      varying vec3 vN, vT, vB, vView, vWorld, vNW;
       void main() {
         float a = cloudCover(cloudMap, vUv, cloudT);
         if (a < 0.004) discard;
         vec3 L = normalize((viewMatrix * vec4(sunDir, 0.0)).xyz);
         vec3 N = normalize(vN), V = normalize(vView);
         float geo = dot(N, L);
-        float lit = smoothstep(-0.12, 0.30, geo);
+        float sunlight = 1.0 - 0.985 * occult(vWorld, sunPos, sunTrueR, moonPos, moonR);
+        float lit = smoothstep(-0.12, 0.30, geo) * sunlight;
         // Forward scattering gives thin cloud a silver edge near the limb.
         float silver = pow(max(dot(V, -L), 0.0), 6.0) * lit;
         vec3 color = mix(vec3(0.012, 0.020, 0.035), vec3(0.97, 0.98, 1.0), lit);
-        color += vec3(1.0, 0.55, 0.25) * exp(-geo * geo / 0.014) * 0.45;
+        color += vec3(1.0, 0.55, 0.25) * exp(-geo * geo / 0.014) * 0.45 * sunlight;
         color += vec3(0.9, 0.95, 1.0) * silver * 0.35;
         gl_FragColor = vec4(color, a * 0.95);
         #include <tonemapping_fragment>
@@ -343,10 +417,113 @@ const atmosphere = new THREE.Mesh(
   })
 );
 
+// The obliquity is fixed in the ecliptic frame: tilting about +X puts the north
+// pole on the sunward side at ecliptic longitude 90°, i.e. the June solstice.
 const axis = new THREE.Group();
-axis.rotation.z = AXIAL_TILT;
+axis.rotation.x = -AXIAL_TILT;
 axis.add(earth, clouds, atmosphere);
 scene.add(axis);
+
+// ── moon ──────────────────────────────────────────────────────────────────
+// Lommel-Seeliger rather than Lambert: the regolith backscatters, which is why
+// a full moon reads as a flat disc instead of a shaded ball.
+const moon = new THREE.Mesh(
+  new THREE.SphereGeometry(R_MOON, 128, 64),
+  new THREE.ShaderMaterial({
+    uniforms: {
+      moonMap: { value: moonMap }, moonBump: { value: moonBump },
+      sunPos, sunTrueR,
+    },
+    vertexShader: VERT,
+    fragmentShader: COMMON + /* glsl */`
+      uniform sampler2D moonMap, moonBump;
+      uniform vec3 sunPos;
+      uniform float sunTrueR;
+      varying vec2 vUv;
+      varying vec3 vN, vT, vB, vView, vWorld, vNW;
+      void main() {
+        vec3 L = normalize(sunPos - vWorld);
+        vec3 N = normalize(vNW);
+        vec3 V = normalize(cameraPosition - vWorld);
+
+        // Crater relief straight off the bump map.
+        vec2 px = vec2(1.0 / 1024.0, 1.0 / 512.0);
+        float dU = texture2D(moonBump, vUv + vec2(px.x, 0.0)).r - texture2D(moonBump, vUv - vec2(px.x, 0.0)).r;
+        float dV = texture2D(moonBump, vUv + vec2(0.0, px.y)).r - texture2D(moonBump, vUv - vec2(0.0, px.y)).r;
+        vec3 Tw = normalize(cross(vec3(0.0, 1.0, 0.0), N) + vec3(1e-5, 0.0, 0.0));
+        vec3 Bw = cross(N, Tw);
+        vec3 Nb = normalize(N - (dU * Tw + dV * Bw) * 1.2);
+
+        float NoL = max(dot(Nb, L), 0.0);
+        float NoV = max(dot(Nb, V), 0.0);
+        float shade = NoL / (NoL + NoV + 0.06);        // Lommel-Seeliger
+        shade *= smoothstep(-0.03, 0.06, dot(N, L));   // clean terminator
+
+        // Lunar eclipse: the earth crossing in front of the sun. What leaks
+        // through is refracted by earth's atmosphere, hence the copper.
+        float cov = occult(vWorld, sunPos, sunTrueR, vec3(0.0), 1.0);
+        vec3 sunlight = mix(vec3(1.0), vec3(0.42, 0.10, 0.045), cov) * (1.0 - 0.93 * cov);
+
+        vec3 albedo = texture2D(moonMap, vUv).rgb;
+        vec3 color = albedo * shade * 2.1 * sunlight;
+
+        // Earthshine on the night side, brightest when earth is near full as
+        // seen from the moon — i.e. around new moon.
+        vec3 toEarth = normalize(-vWorld);
+        float earthPhase = 0.5 * (1.0 - dot(L, toEarth));
+        color += albedo * vec3(0.32, 0.44, 0.75) * 0.05 * earthPhase *
+                 max(dot(Nb, toEarth), 0.0) * (1.0 - shade);
+
+        gl_FragColor = vec4(color, 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`,
+  })
+);
+scene.add(moon);
+
+// ── sun ───────────────────────────────────────────────────────────────────
+const sun = new THREE.Mesh(
+  new THREE.SphereGeometry(SUN_R, 48, 24),
+  new THREE.ShaderMaterial({
+    depthWrite: false,
+    vertexShader: VERT,
+    fragmentShader: /* glsl */`
+      varying vec2 vUv;
+      varying vec3 vN, vT, vB, vView, vWorld, vNW;
+      void main() {
+        float mu = max(dot(normalize(vNW), normalize(cameraPosition - vWorld)), 0.0);
+        float limbDark = 0.35 + 0.65 * pow(mu, 0.55);   // classic solar profile
+        vec3 color = mix(vec3(1.0, 0.72, 0.36), vec3(1.0, 0.99, 0.96), limbDark) * 4.0;
+        gl_FragColor = vec4(color, 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`,
+  })
+);
+scene.add(sun);
+
+// Radial-gradient glare, drawn to a canvas so nothing is fetched over the wire.
+{
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 256;
+  const ctx = cv.getContext('2d');
+  const grd = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+  grd.addColorStop(0.00, 'rgba(255,252,242,0.95)');
+  grd.addColorStop(0.06, 'rgba(255,240,205,0.55)');
+  grd.addColorStop(0.22, 'rgba(255,205,130,0.16)');
+  grd.addColorStop(0.55, 'rgba(255,170,90,0.04)');
+  grd.addColorStop(1.00, 'rgba(255,150,70,0)');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0, 0, 256, 256);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const glare = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true,
+  }));
+  glare.scale.setScalar(SUN_R * 26);
+  sun.add(glare);
+}
 
 // ── starfield ─────────────────────────────────────────────────────────────
 {
@@ -354,7 +531,7 @@ scene.add(axis);
   const c = new THREE.Color();
   for (let i = 0; i < N; i++) {
     const u = Math.random() * 2 - 1, th = Math.random() * TAU;
-    const r = 600, s = Math.sqrt(1 - u * u);
+    const r = 15000, s = Math.sqrt(1 - u * u);
     pos.set([r * s * Math.cos(th), r * u, r * s * Math.sin(th)], i * 3);
     const mag = Math.pow(Math.random(), 3.2);          // few bright, many faint
     c.setHSL(0.55 + Math.random() * 0.12, 0.3 * Math.random(), 0.35 + mag * 0.65);
@@ -382,20 +559,108 @@ scene.add(axis);
   })));
 }
 
+// ── ephemeris ─────────────────────────────────────────────────────────────
+// Low-precision Keplerian elements referred to J2000, good to a fraction of a
+// degree — enough that phases, seasons and eclipse seasons all land correctly.
+const kepler = (M, e) => {
+  let E = M + e * Math.sin(M) * (1 + e * Math.cos(M));
+  for (let i = 0; i < 6; i++) E -= (E - e * Math.sin(E) - M) / (1 - e * Math.cos(E));
+  return E;
+};
+const trueAnomaly = (E, e) =>
+  2 * Math.atan2(Math.sqrt(1 + e) * Math.sin(E / 2), Math.sqrt(1 - e) * Math.cos(E / 2));
+
+const _sunUnit = new THREE.Vector3();
+
+// Geocentric sun: the reflection of earth's own orbit, so its eccentricity is
+// what makes the seasons unequal in length.
+function sunEphemeris(d, out) {
+  const M = (357.5291 + 0.98560028 * d) * DEG;
+  const w = (282.9404 + 4.70935e-5 * d) * DEG;      // longitude of perihelion
+  const e = 0.016709;
+  const E = kepler(M, e);
+  const lon = trueAnomaly(E, e) + w;
+  const rAU = 1 - e * Math.cos(E);
+  _sunUnit.set(Math.cos(lon), 0, -Math.sin(lon));
+  out.copy(_sunUnit).multiplyScalar(SUN_DIST);
+  return { rAU, lon };
+}
+
+// Geocentric moon. The node regresses on its 18.6-year cycle and perigee
+// advances on its 8.85-year one, which is what spaces the eclipse seasons.
+function moonEphemeris(d, out) {
+  const L  = (218.3165 + 13.17639648 * d) * DEG;    // mean longitude
+  const M  = (134.9634 + 13.06499295 * d) * DEG;    // mean anomaly
+  const Om = (125.0445 -  0.05295377 * d) * DEG;    // ascending node
+  const w  = L - M - Om;                            // argument of perigee
+  const E  = kepler(M, E_MOON);
+  const r  = A_MOON * (1 - E_MOON * Math.cos(E));
+  const u  = trueAnomaly(E, E_MOON) + w;            // argument of latitude
+
+  const ci = Math.cos(I_MOON), si = Math.sin(I_MOON);
+  const cu = Math.cos(u), su = Math.sin(u);
+  const x = r * (Math.cos(Om) * cu - Math.sin(Om) * su * ci);
+  const y = r * (Math.sin(Om) * cu + Math.cos(Om) * su * ci);
+  out.set(x, r * su * si, -y);
+  return { r, meanLon: L };
+}
+
 // ── simulation ────────────────────────────────────────────────────────────
-const state = { t: 0, rate: 3600, paused: false };
-const rateEl = document.getElementById('rate');
-const sunEl = document.getElementById('sun');
+// t counts seconds from J2000 and starts at the wall clock, so the phase and
+// the season on screen are the ones outside the window.
+addEventListener('hashchange', () => { state.t = (startMs() - J2000_MS) / 1000; state.paused = true; });
+const el = id => document.getElementById(id);
+const prevMoon = new THREE.Vector3();
 
 const fmtRate = r => r >= 86400 ? (r / 86400).toFixed(1) + ' d/s'
   : r >= 3600 ? (r / 3600).toFixed(1) + ' h/s'
   : r >= 60 ? (r / 60).toFixed(1) + ' m/s' : r.toFixed(0) + '×';
+
+const PHASES = ['new', 'waxing crescent', 'first quarter', 'waxing gibbous',
+                'full', 'waning gibbous', 'last quarter', 'waning crescent'];
+
+// Same angular-radius test as the shader, for the readout.
+function occultation(p, sunP, sunR, occP, occR) {
+  const ts = sunP.clone().sub(p), to = occP.clone().sub(p);
+  const sep = ts.angleTo(to);
+  const rs = Math.asin(Math.min(1, sunR / ts.length()));
+  const ro = Math.asin(Math.min(1, occR / to.length()));
+  if (sep >= rs + ro) return 0;
+  const cov = 1 - THREE.MathUtils.smoothstep(sep, Math.abs(ro - rs), ro + rs);
+  return cov * Math.min(1, (ro * ro) / (rs * rs));
+}
+
+function setFocus(mode) {
+  state.focus = mode === 'moon' ? 'moon' : 'earth';
+  controls.minDistance = mode === 'moon' ? R_MOON * 1.2 : 1.05;
+
+  if (mode === 'system') {
+    // Look down the perpendicular to the earth-moon line, from far enough out
+    // that both fit — which is the only honest way to show 60 earth radii.
+    const side = new THREE.Vector3()
+      .crossVectors(moon.position, new THREE.Vector3(0, 1, 0)).normalize();
+    controls.target.set(0, 0, 0);
+    camera.position.copy(side).multiplyScalar(Math.cos(0.42))
+      .addScaledVector(new THREE.Vector3(0, 1, 0), Math.sin(0.42))
+      .multiplyScalar(moon.position.length() * 2.8);
+    return;
+  }
+
+  const target = mode === 'moon' ? moon.position.clone() : new THREE.Vector3();
+  const dir = camera.position.clone().sub(controls.target).normalize();
+  controls.target.copy(target);
+  camera.position.copy(target).addScaledVector(dir, mode === 'moon' ? 1.1 : 3.2);
+}
 
 addEventListener('keydown', e => {
   if (e.code === 'Space') { state.paused = !state.paused; e.preventDefault(); }
   if (e.key === ']') state.rate = Math.min(state.rate * 2, 86400 * 32);
   if (e.key === '[') state.rate = Math.max(state.rate / 2, 1);
   if (e.key === 'c') { clouds.visible = !clouds.visible; cloudOn.value = clouds.visible ? 1 : 0; }
+  if (e.key === '1') setFocus('earth');
+  if (e.key === '2') setFocus('system');
+  if (e.key === '3') setFocus('moon');
+  if (e.key === 't') state.t = (Date.now() - J2000_MS) / 1000;
 });
 
 addEventListener('resize', () => {
@@ -404,10 +669,9 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
 });
 
-const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
-  if (!state.paused) {
+  if (!state.paused && state.ready) {
     state.t += dt * state.rate;
     cloudT.value += dt * state.rate / DAY;
     // Swell has its own clock: real-time-ish, so it neither freezes at 1× nor
@@ -415,16 +679,59 @@ renderer.setAnimationLoop(() => {
     waveT.value += dt * Math.min(Math.max(state.rate / 240, 0.6), 24);
   }
 
-  earth.rotation.y = (state.t / DAY) * TAU;
-  clouds.rotation.y = earth.rotation.y;      // relative drift lives in cloudWarp
+  const d = state.t / DAY;                            // days since J2000
+  const s = sunEphemeris(d, sunPos.value);
+  const m = moonEphemeris(d, moonPos.value);
 
-  const a = (state.t / YEAR) * TAU;
-  sunDir.set(Math.cos(a), 0, -Math.sin(a));
+  sunDir.copy(_sunUnit);
+  sun.position.copy(sunPos.value);
+  sun.scale.setScalar(1 / s.rAU);                     // apparent size over the year
+  sunTrueR.value = SUN_R / s.rAU;
+  moon.position.copy(moonPos.value);
+
+  // Tidally locked, but to the mean longitude rather than the true one — the
+  // difference is exactly the optical libration in longitude.
+  moon.rotation.y = m.meanLon + Math.PI;
+
+  // Spin the earth by Greenwich mean sidereal time, which makes the solar day
+  // come out at 24h on its own.
+  earth.rotation.y = (280.4606 * DEG) + (state.t / SIDEREAL) * TAU;
+  clouds.rotation.y = earth.rotation.y;
+
+  if (state.focus === 'moon') {
+    camera.position.add(moon.position.clone().sub(prevMoon));
+    controls.target.copy(moon.position);
+  }
+  prevMoon.copy(moon.position);
 
   waveFade.value = 1 - THREE.MathUtils.smoothstep(camera.position.length(), 1.5, 9.0);
 
-  rateEl.textContent = state.paused ? 'paused' : fmtRate(state.rate);
-  sunEl.textContent = (((state.t / DAY) * 360) % 360).toFixed(0) + '°';
+  // ── readout ──
+  el('date').textContent = new Date(J2000_MS + state.t * 1000)
+    .toISOString().slice(0, 16).replace('T', ' ');
+  el('rate').textContent = state.paused ? 'paused' : fmtRate(state.rate);
+
+  const toSun = sunPos.value.clone().sub(moonPos.value).normalize();
+  const toEarth = moonPos.value.clone().negate().normalize();
+  const illum = 0.5 * (1 + toSun.dot(toEarth));
+  let elong = (m.meanLon - s.lon) % TAU;
+  if (elong < 0) elong += TAU;
+  el('phase').textContent =
+    PHASES[Math.round(elong / TAU * 8) % 8] + ' ' + (illum * 100).toFixed(0) + '%';
+  el('dist').textContent =
+    (m.r * RE_KM).toLocaleString('en-US', { maximumFractionDigits: 0 }) + ' km';
+
+  // Probe where the moon's shadow axis actually meets the globe, not the
+  // geocentre — a grazing polar eclipse is real even when the centre sees none.
+  const shadow = moonPos.value.clone().sub(sunPos.value).normalize();
+  const b = moonPos.value.dot(shadow), disc = b * b - (moonPos.value.lengthSq() - 1);
+  const probe = disc >= 0
+    ? moonPos.value.clone().addScaledVector(shadow, -b - Math.sqrt(disc))
+    : moonPos.value.clone().addScaledVector(shadow, -b).normalize();
+  const solar = occultation(probe, sunPos.value, sunTrueR.value, moonPos.value, R_MOON);
+  const lunar = occultation(moonPos.value, sunPos.value, sunTrueR.value, new THREE.Vector3(), 1);
+  el('ecl').innerHTML = solar > 0.001 ? ' · <i>solar eclipse ' + (solar * 100).toFixed(0) + '%</i>'
+    : lunar > 0.001 ? ' · <i>lunar eclipse ' + (lunar * 100).toFixed(0) + '%</i>' : '';
 
   controls.update();
   renderer.render(scene, camera);
