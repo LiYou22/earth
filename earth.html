@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Earth — three.js</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; }
+  #hud, #load {
+    position: fixed;
+    font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #7f8c9b; user-select: none; pointer-events: none;
+  }
+  #hud { left: 16px; bottom: 14px; }
+  #hud b { color: #cfd8e3; font-weight: 500; }
+  #load { left: 50%; top: 50%; transform: translate(-50%, -50%); color: #46525f; }
+</style>
+</head>
+<body>
+<div id="load">loading textures…</div>
+<div id="hud">
+  drag <b>orbit</b> · scroll <b>zoom</b> · <b>space</b> pause · <b>[ ]</b> time scale · <b>c</b> clouds<br>
+  time <b id="rate">1×</b> · sun lon <b id="sun">0°</b>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.185.1/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.1/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const AXIAL_TILT = 23.44 * Math.PI / 180;
+const DAY = 86400;
+const YEAR = 365.256 * DAY;
+const TAU = Math.PI * 2;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.NeutralToneMapping;   // keeps ocean/land saturation
+renderer.toneMappingExposure = 1.0;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.01, 2000);
+camera.position.set(2.3, 0.9, 2.5);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.06;
+controls.minDistance = 1.05;
+controls.maxDistance = 40;
+controls.rotateSpeed = 0.4;
+controls.zoomSpeed = 0.7;
+
+// ── textures ──────────────────────────────────────────────────────────────
+// All hosts below send `access-control-allow-origin: *`, which WebGL requires
+// even when this page is opened straight off disk.
+const manager = new THREE.LoadingManager(() => document.getElementById('load').remove());
+const loader = new THREE.TextureLoader(manager);
+const aniso = renderer.capabilities.getMaxAnisotropy();
+const load = (url, colorSpace = THREE.NoColorSpace) => {
+  const t = loader.load(url);
+  t.colorSpace = colorSpace;
+  t.anisotropy = aniso;
+  t.wrapS = THREE.RepeatWrapping;
+  return t;
+};
+const GLOBE = 'https://cdn.jsdelivr.net/npm/three-globe/example/img/';
+const TURBAN = 'https://raw.githubusercontent.com/turban/webgl-earth/master/images/';
+
+const dayMap   = load(GLOBE + 'earth-blue-marble.jpg', THREE.SRGBColorSpace); // 4096²  NASA albedo
+const nightMap = load(GLOBE + 'earth-night.jpg', THREE.SRGBColorSpace);       // 4096²  city lights
+const waterMap = load(TURBAN + 'water_4k.png');                               // 4096²  white = ocean
+const elevMap  = load(TURBAN + 'elev_bump_4k.jpg');                           // 4096²  elevation + bathymetry
+const cloudMap = load(TURBAN + 'fair_clouds_4k.png', THREE.SRGBColorSpace);   // 4096²  alpha = coverage
+
+// Shared animation clocks. cloudT is in simulated days; waveT is a separate,
+// rate-limited clock so swell does not strobe when the sim runs at days/second.
+const sunDir   = new THREE.Vector3(1, 0, 0);
+const cloudT   = { value: 0 };
+const waveT    = { value: 0 };
+const waveFade = { value: 1 };
+const cloudOn  = { value: 1 };
+
+// Shared GLSL. The noise is periodic in x so nothing seams on the antimeridian.
+const COMMON = /* glsl */`
+  float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+  // Value noise that tiles every 'period' units in x. Period must be integral.
+  float pnoise(vec2 p, float period) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float x0 = mod(i.x, period), x1 = mod(i.x + 1.0, period);
+    return mix(mix(hash(vec2(x0, i.y)),       hash(vec2(x1, i.y)),       f.x),
+               mix(hash(vec2(x0, i.y + 1.0)), hash(vec2(x1, i.y + 1.0)), f.x), f.y);
+  }
+  float ggx(float NoH, float rough) {
+    float a = rough * rough, a2 = a * a;
+    float d = NoH * NoH * (a2 - 1.0) + 1.0;
+    return a2 / (3.14159265 * d * d);
+  }
+
+  // ── animated cloud field ────────────────────────────────────────────────
+  // Bands slide east or west by latitude (trades, westerlies, polar easterlies)
+  // and a drifting domain warp deforms systems as they go, so the layer evolves
+  // instead of spinning rigidly. Both the cloud mesh and the surface's shadow
+  // lookup call this, which is what keeps shadows pinned under their clouds.
+  vec2 cloudWarp(vec2 uv, float t) {
+    float lat = (uv.y - 0.5) * 3.14159265;
+    float zonal = -0.15 - 0.60 * cos(lat * 5.5);
+    uv.x += zonal * t * 0.055 / max(cos(lat), 0.25);   // uniform angular speed
+
+    vec2 p = vec2(uv.x * 6.0, uv.y * 3.0);
+    vec2 w = vec2(pnoise(p + vec2(t * 0.30, 0.0), 6.0),
+                  pnoise(p + vec2(3.7, t * 0.24), 6.0)) - 0.5;
+    vec2 q = vec2(uv.x * 20.0, uv.y * 10.0);
+    vec2 w2 = vec2(pnoise(q - vec2(t * 0.85, 0.0), 20.0),
+                   pnoise(q + vec2(9.1, t * 0.70), 20.0)) - 0.5;
+    return uv + w * 0.018 + w2 * 0.004;
+  }
+
+  // Cross-fade of two offset copies so cover grows and clears over time.
+  float cloudCover(sampler2D tex, vec2 uv, float t) {
+    vec2 p = cloudWarp(uv, t);
+    float a = texture2D(tex, p).a;
+    float b = texture2D(tex, p + vec2(0.023, 0.011)).a;
+    float m = pnoise(vec2(uv.x * 4.0 + t * 0.11, uv.y * 2.0 + t * 0.06), 4.0);
+    return mix(a, max(a * 0.55, b), smoothstep(0.35, 0.8, m) * 0.6);
+  }
+`;
+
+const VERT = /* glsl */`
+  varying vec2 vUv;
+  varying vec3 vN, vT, vB, vView;
+  void main() {
+    vUv = uv;
+    // Equirect UVs run around +Y, so d(pos)/du is analytic — no tangent attribute.
+    vec3 t = vec3(position.z, 0.0, -position.x);
+    t = length(t) > 1e-4 ? normalize(t) : vec3(1.0, 0.0, 0.0);
+    vN = normalize(normalMatrix * normal);
+    vT = normalize(normalMatrix * t);
+    vB = cross(vN, vT);                 // points north
+    vec4 mv = modelViewMatrix * vec4(position, 1.0);
+    vView = -mv.xyz;
+    gl_Position = projectionMatrix * mv;
+  }`;
+
+// ── earth surface ─────────────────────────────────────────────────────────
+// Land and ocean are shaded as different materials, split by the water mask:
+// land is rough Lambert lit through a relief normal derived from the elevation
+// map; ocean is a low-albedo dielectric with animated swell, Fresnel sky
+// reflection and a GGX sun glint. Cloud shadow and limb haze go on top.
+const earthMat = new THREE.ShaderMaterial({
+  uniforms: {
+    dayMap: { value: dayMap }, nightMap: { value: nightMap },
+    waterMap: { value: waterMap }, elevMap: { value: elevMap },
+    cloudMap: { value: cloudMap },
+    sunDir: { value: sunDir }, cloudT, waveT, waveFade, cloudOn,
+  },
+  vertexShader: VERT,
+  fragmentShader: COMMON + /* glsl */`
+    uniform sampler2D dayMap, nightMap, waterMap, elevMap, cloudMap;
+    uniform vec3 sunDir;
+    uniform float cloudT, waveT, waveFade, cloudOn;
+    varying vec2 vUv;
+    varying vec3 vN, vT, vB, vView;
+
+    const vec3 SUN  = vec3(1.0, 0.97, 0.92);
+    const vec3 SKY  = vec3(0.20, 0.40, 0.85);
+    const vec3 DUSK = vec3(1.0, 0.40, 0.13);
+
+    // Slope of one scrolling swell octave, in (east, north) tangent units.
+    vec2 swell(vec2 uv, float freq, float t, vec2 dir) {
+      vec2 p = vec2(uv.x * freq, uv.y * freq * 0.5) + dir * t;
+      const float e = 0.09;
+      float n = pnoise(p, freq);
+      return vec2(pnoise(p + vec2(e, 0.0), freq) - n,
+                  pnoise(p + vec2(0.0, e), freq) - n) / e;
+    }
+
+    void main() {
+      vec3 L = normalize((viewMatrix * vec4(sunDir, 0.0)).xyz);
+      vec3 V = normalize(vView);
+      vec3 N = normalize(vN), T = normalize(vT), B = normalize(vB);
+
+      float water = texture2D(waterMap, vUv).r;
+      float land  = 1.0 - water;
+
+      // Relief normal: central differences on the elevation map, land only —
+      // the ocean floor must not bumpify the sea surface.
+      vec2 px = vec2(1.0 / 4096.0, 1.0 / 2048.0);
+      float dU = texture2D(elevMap, vUv + vec2(px.x, 0.0)).r - texture2D(elevMap, vUv - vec2(px.x, 0.0)).r;
+      float dV = texture2D(elevMap, vUv + vec2(0.0, px.y)).r - texture2D(elevMap, vUv - vec2(0.0, px.y)).r;
+      vec3 Nb = normalize(N - (dU * T + dV * B) * 9.0 * land);
+
+      // Two crossing swell trains, faded out at distance so they cannot alias.
+      vec2 g = swell(vUv, 320.0, waveT, vec2(1.0, 0.35)) * 0.8
+             + swell(vUv,  96.0, waveT * 0.45, vec2(-0.7, 0.5)) * 1.5;
+      Nb = normalize(Nb - (g.x * T + g.y * B) * 0.011 * water * waveFade);
+
+      float geo  = dot(N, L);                          // sphere-level sun angle
+      float limb = smoothstep(-0.05, 0.09, geo);       // soft terminator
+      float NoL  = max(dot(Nb, L), 0.0);
+      float NoV  = max(dot(N, V), 0.0);
+      float lit  = NoL * limb;
+
+      float cover = cloudCover(cloudMap, vUv, cloudT) * cloudOn;
+      float cshadow = 1.0 - cloudOn * 0.5 *
+        cloudCover(cloudMap, vUv + vec2(dot(L, T), dot(L, B)) * 0.010, cloudT);
+
+      vec3 albedo = texture2D(dayMap, vUv).rgb;
+      float elev  = texture2D(elevMap, vUv).r;
+
+      // ── land ──
+      vec3 landCol = albedo * lit * cshadow * 1.15;
+
+      // ── ocean ──
+      // Blue Marble's ocean is near-black albedo, so open water gets its colour
+      // from depth-tinted scattering rather than from the texture.
+      vec3 deep    = vec3(0.0045, 0.0180, 0.0520);
+      vec3 shallow = vec3(0.0300, 0.1150, 0.1600);
+      vec3 wAlb = mix(deep, shallow, smoothstep(0.10, 0.36, elev)) + albedo * 0.45;
+
+      // Roughness drifts with the wind field, which makes the glint sparkle.
+      float chop = mix(0.075, 0.155,
+        pnoise(vec2(vUv.x * 256.0 + waveT * 0.6, vUv.y * 128.0), 256.0) * 0.6 +
+        pnoise(vec2(vUv.x * 64.0 - waveT * 0.2, vUv.y * 32.0), 64.0) * 0.4);
+
+      vec3  H     = normalize(L + V);
+      float NoH   = max(dot(Nb, H), 0.0);
+      float fres  = 0.02 + 0.98 * pow(1.0 - NoV, 5.0);
+      float glint = ggx(NoH, chop) * fres / (4.0 * NoV + 0.05);
+
+      vec3 oceanCol = wAlb * lit * cshadow
+                    + SUN * min(glint * NoL * limb, 6.0) * 0.9
+                    + SKY * fres * (0.05 + 0.55 * limb);
+
+      vec3 color = mix(landCol, oceanCol, water);
+
+      // Rayleigh haze in the column of air we are looking through: strongest at
+      // the limb, and reddened where that column is grazing the terminator.
+      float haze = pow(1.0 - NoV, 3.0);
+      float dusk = exp(-geo * geo / 0.010);
+      color += mix(SKY, DUSK, dusk * 0.85) * haze * limb * 0.55;
+      color += DUSK * dusk * limb * 0.05 * (0.3 + 0.7 * water);
+
+      // ── night side ──
+      float night = smoothstep(0.10, -0.14, geo);
+      color += texture2D(nightMap, vUv).rgb * night * 1.35 * (1.0 - cover * 0.65);
+      color += albedo * 0.012 * night;                   // earthshine
+
+      gl_FragColor = vec4(color, 1.0);
+      #include <tonemapping_fragment>
+      #include <colorspace_fragment>
+    }`,
+});
+const earth = new THREE.Mesh(new THREE.SphereGeometry(1, 256, 128), earthMat);
+
+// ── clouds ────────────────────────────────────────────────────────────────
+const clouds = new THREE.Mesh(
+  new THREE.SphereGeometry(1.004, 160, 80),
+  new THREE.ShaderMaterial({
+    uniforms: { cloudMap: { value: cloudMap }, sunDir: { value: sunDir }, cloudT },
+    transparent: true,
+    depthWrite: false,
+    vertexShader: VERT,
+    fragmentShader: COMMON + /* glsl */`
+      uniform sampler2D cloudMap;
+      uniform vec3 sunDir;
+      uniform float cloudT;
+      varying vec2 vUv;
+      varying vec3 vN, vT, vB, vView;
+      void main() {
+        float a = cloudCover(cloudMap, vUv, cloudT);
+        if (a < 0.004) discard;
+        vec3 L = normalize((viewMatrix * vec4(sunDir, 0.0)).xyz);
+        vec3 N = normalize(vN), V = normalize(vView);
+        float geo = dot(N, L);
+        float lit = smoothstep(-0.12, 0.30, geo);
+        // Forward scattering gives thin cloud a silver edge near the limb.
+        float silver = pow(max(dot(V, -L), 0.0), 6.0) * lit;
+        vec3 color = mix(vec3(0.012, 0.020, 0.035), vec3(0.97, 0.98, 1.0), lit);
+        color += vec3(1.0, 0.55, 0.25) * exp(-geo * geo / 0.014) * 0.45;
+        color += vec3(0.9, 0.95, 1.0) * silver * 0.35;
+        gl_FragColor = vec4(color, a * 0.95);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`,
+  })
+);
+
+// ── atmosphere ────────────────────────────────────────────────────────────
+// A fresnel term would peak at this shell's own silhouette, i.e. as a ring
+// floating off the limb. Instead each fragment measures its ray's impact
+// parameter against the planet and falls off exponentially from the surface,
+// so the glow hugs the limb no matter how oversized the proxy sphere is.
+const atmosphere = new THREE.Mesh(
+  new THREE.SphereGeometry(1.4, 64, 32),
+  new THREE.ShaderMaterial({
+    uniforms: { sunDir: { value: sunDir } },
+    side: THREE.BackSide,
+    transparent: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    vertexShader: /* glsl */`
+      varying vec3 vP, vC;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        vP = mv.xyz;
+        vC = (modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: /* glsl */`
+      uniform vec3 sunDir;
+      varying vec3 vP, vC;
+      void main() {
+        vec3 D = normalize(vP);                 // camera sits at the view origin
+        vec3 P = dot(vC, D) * D;                // closest approach to the centre
+        float h = max(length(P - vC) - 1.0, 0.0);
+        float glow = exp(-h / 0.020) + 0.45 * exp(-h / 0.070);
+
+        vec3 L = normalize((viewMatrix * vec4(sunDir, 0.0)).xyz);
+        float geo  = dot(normalize(P - vC), L);
+        float sun  = smoothstep(-0.25, 0.35, geo);
+        float dusk = exp(-geo * geo / 0.012);
+
+        vec3 color = mix(vec3(0.05, 0.14, 0.45), vec3(0.38, 0.62, 1.0), sun);
+        color = mix(color, vec3(1.0, 0.42, 0.12), dusk * 0.75);
+        gl_FragColor = vec4(color * glow * (0.10 + sun * 1.25 + dusk * 0.8), 1.0);
+        #include <tonemapping_fragment>
+        #include <colorspace_fragment>
+      }`,
+  })
+);
+
+const axis = new THREE.Group();
+axis.rotation.z = AXIAL_TILT;
+axis.add(earth, clouds, atmosphere);
+scene.add(axis);
+
+// ── starfield ─────────────────────────────────────────────────────────────
+{
+  const N = 7000, pos = new Float32Array(N * 3), col = new Float32Array(N * 3);
+  const c = new THREE.Color();
+  for (let i = 0; i < N; i++) {
+    const u = Math.random() * 2 - 1, th = Math.random() * TAU;
+    const r = 600, s = Math.sqrt(1 - u * u);
+    pos.set([r * s * Math.cos(th), r * u, r * s * Math.sin(th)], i * 3);
+    const mag = Math.pow(Math.random(), 3.2);          // few bright, many faint
+    c.setHSL(0.55 + Math.random() * 0.12, 0.3 * Math.random(), 0.35 + mag * 0.65);
+    col.set([c.r, c.g, c.b], i * 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+
+  const cv = document.createElement('canvas');
+  cv.width = cv.height = 64;
+  const ctx = cv.getContext('2d');
+  const grd = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
+  grd.addColorStop(0, 'rgba(255,255,255,1)');
+  grd.addColorStop(0.3, 'rgba(255,255,255,0.5)');
+  grd.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = grd;
+  ctx.fillRect(0, 0, 64, 64);
+  const sprite = new THREE.CanvasTexture(cv);
+  sprite.colorSpace = THREE.SRGBColorSpace;
+
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({
+    size: 2.6, map: sprite, vertexColors: true, transparent: true,
+    depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: false,
+  })));
+}
+
+// ── simulation ────────────────────────────────────────────────────────────
+const state = { t: 0, rate: 3600, paused: false };
+const rateEl = document.getElementById('rate');
+const sunEl = document.getElementById('sun');
+
+const fmtRate = r => r >= 86400 ? (r / 86400).toFixed(1) + ' d/s'
+  : r >= 3600 ? (r / 3600).toFixed(1) + ' h/s'
+  : r >= 60 ? (r / 60).toFixed(1) + ' m/s' : r.toFixed(0) + '×';
+
+addEventListener('keydown', e => {
+  if (e.code === 'Space') { state.paused = !state.paused; e.preventDefault(); }
+  if (e.key === ']') state.rate = Math.min(state.rate * 2, 86400 * 32);
+  if (e.key === '[') state.rate = Math.max(state.rate / 2, 1);
+  if (e.key === 'c') { clouds.visible = !clouds.visible; cloudOn.value = clouds.visible ? 1 : 0; }
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (!state.paused) {
+    state.t += dt * state.rate;
+    cloudT.value += dt * state.rate / DAY;
+    // Swell has its own clock: real-time-ish, so it neither freezes at 1× nor
+    // strobes at 32 d/s, but it still stops when the sim is paused.
+    waveT.value += dt * Math.min(Math.max(state.rate / 240, 0.6), 24);
+  }
+
+  earth.rotation.y = (state.t / DAY) * TAU;
+  clouds.rotation.y = earth.rotation.y;      // relative drift lives in cloudWarp
+
+  const a = (state.t / YEAR) * TAU;
+  sunDir.set(Math.cos(a), 0, -Math.sin(a));
+
+  waveFade.value = 1 - THREE.MathUtils.smoothstep(camera.position.length(), 1.5, 9.0);
+
+  rateEl.textContent = state.paused ? 'paused' : fmtRate(state.rate);
+  sunEl.textContent = (((state.t / DAY) * 360) % 360).toFixed(0) + '°';
+
+  controls.update();
+  renderer.render(scene, camera);
+});
+</script>
+</body>
+</html>
