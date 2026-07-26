@@ -65,16 +65,20 @@ const SUN_R     = SUN_DIST * SUN_RATIO;
 
 const J2000_MS = Date.UTC(2000, 0, 1, 12, 0, 0);
 
-// #2027-08-02T10:07 jumps the clock there; no fragment means right now.
+// #2027-08-02T10:07 jumps the clock there. Null means no fragment, or one that
+// would not parse — either way the caller falls back to the wall clock.
 const startMs = () => {
   const h = decodeURIComponent(location.hash.slice(1));
-  const ms = h ? Date.parse(/[Zz+]|T.*-/.test(h) ? h : h + 'Z') : NaN;
-  return Number.isNaN(ms) ? Date.now() : ms;
+  if (!h) return null;
+  const ms = Date.parse(/[Zz+]|T.*-/.test(h) ? h : h + 'Z');
+  return Number.isNaN(ms) ? null : ms;
 };
-// A #timestamp means the user asked for a specific moment, so hold there
-// rather than drifting away from it while they look.
-const state = { t: (startMs() - J2000_MS) / 1000, rate: 3600, ready: false,
-                paused: location.hash.length > 1, focus: 'earth' };
+// A parseable #timestamp means the user asked for a specific moment, so hold
+// there rather than drifting away from it while they look. A hash that did not
+// parse must not freeze the sim on a time nobody asked for.
+const t0 = startMs();
+const state = { t: ((t0 ?? Date.now()) - J2000_MS) / 1000, rate: 3600, ready: false,
+                paused: t0 !== null, focus: 'earth' };
 const clock = new THREE.Clock();
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -87,7 +91,7 @@ document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.02, 40000);
-camera.position.set(2.3, 0.9, 2.5);
+// Placed from the ephemeris once sunEphemeris exists, further down.
 
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
@@ -100,13 +104,19 @@ controls.zoomSpeed = 0.7;
 // ── textures ──────────────────────────────────────────────────────────────
 // All hosts below send an allow-all CORS header, which WebGL requires even
 // when this page is opened straight off disk.
-const manager = new THREE.LoadingManager(() => {
-  document.getElementById('load').remove();
-  // Hold the clock until the textures are in, or a #timestamp in the url lands
-  // however many minutes of loading later.
+// Hold the clock until the textures are in, or a #timestamp in the url lands
+// however many minutes of loading later.
+const markReady = () => {
+  if (state.ready) return;
   state.ready = true;
-  clock.getDelta();
-});
+  clock.getDelta();                       // drop the time spent loading
+  document.getElementById('load')?.remove();
+};
+const manager = new THREE.LoadingManager(markReady);
+// A 404 is safe — three still calls itemEnd — but a request that hangs on a
+// stalled proxy or DNS never resolves the manager, which would leave the sim
+// frozen behind the loading text forever.
+setTimeout(markReady, 8000);
 const loader = new THREE.TextureLoader(manager);
 const aniso = renderer.capabilities.getMaxAnisotropy();
 const load = (url, colorSpace = THREE.NoColorSpace) => {
@@ -145,13 +155,18 @@ const cloudOn  = { value: 1 };
 const COMMON = /* glsl */`
   float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 
-  // Value noise that tiles every 'period' units in x. Period must be integral.
-  float pnoise(vec2 p, float period) {
+  // Value noise that tiles on BOTH axes; each component of 'period' must be
+  // integral. Wrapping y matters as much as x: callers scroll time into both
+  // axes, and on an unwrapped axis the coordinate grows without bound until
+  // hash()'s sin() runs out of mantissa and the field degenerates into bands.
+  // Folding p first is exact here precisely because the noise is periodic.
+  float pnoise(vec2 p, vec2 period) {
+    p = mod(p, period);
     vec2 i = floor(p), f = fract(p);
     f = f * f * (3.0 - 2.0 * f);
-    float x0 = mod(i.x, period), x1 = mod(i.x + 1.0, period);
-    return mix(mix(hash(vec2(x0, i.y)),       hash(vec2(x1, i.y)),       f.x),
-               mix(hash(vec2(x0, i.y + 1.0)), hash(vec2(x1, i.y + 1.0)), f.x), f.y);
+    vec2 lo = mod(i, period), hi = mod(i + 1.0, period);
+    return mix(mix(hash(vec2(lo.x, lo.y)), hash(vec2(hi.x, lo.y)), f.x),
+               mix(hash(vec2(lo.x, hi.y)), hash(vec2(hi.x, hi.y)), f.x), f.y);
   }
   float ggx(float NoH, float rough) {
     float a = rough * rough, a2 = a * a;
@@ -182,11 +197,11 @@ const COMMON = /* glsl */`
     uv.x += zonal * t * 0.055 / max(cos(lat), 0.25);   // uniform angular speed
 
     vec2 p = vec2(uv.x * 6.0, uv.y * 3.0);
-    vec2 w = vec2(pnoise(p + vec2(t * 0.30, 0.0), 6.0),
-                  pnoise(p + vec2(3.7, t * 0.24), 6.0)) - 0.5;
+    vec2 w = vec2(pnoise(p + vec2(t * 0.30, 0.0), vec2(6.0, 3.0)),
+                  pnoise(p + vec2(3.7, t * 0.24), vec2(6.0, 3.0))) - 0.5;
     vec2 q = vec2(uv.x * 20.0, uv.y * 10.0);
-    vec2 w2 = vec2(pnoise(q - vec2(t * 0.85, 0.0), 20.0),
-                   pnoise(q + vec2(9.1, t * 0.70), 20.0)) - 0.5;
+    vec2 w2 = vec2(pnoise(q - vec2(t * 0.85, 0.0), vec2(20.0, 10.0)),
+                   pnoise(q + vec2(9.1, t * 0.70), vec2(20.0, 10.0))) - 0.5;
     return uv + w * 0.018 + w2 * 0.004;
   }
 
@@ -195,7 +210,7 @@ const COMMON = /* glsl */`
     vec2 p = cloudWarp(uv, t);
     float a = texture2D(tex, p).a;
     float b = texture2D(tex, p + vec2(0.023, 0.011)).a;
-    float m = pnoise(vec2(uv.x * 4.0 + t * 0.11, uv.y * 2.0 + t * 0.06), 4.0);
+    float m = pnoise(vec2(uv.x * 4.0 + t * 0.11, uv.y * 2.0 + t * 0.06), vec2(4.0, 2.0));
     return mix(a, max(a * 0.55, b), smoothstep(0.35, 0.8, m) * 0.6);
   }
 `;
@@ -247,11 +262,12 @@ const earthMat = new THREE.ShaderMaterial({
 
     // Slope of one scrolling swell octave, in (east, north) tangent units.
     vec2 swell(vec2 uv, float freq, float t, vec2 dir) {
+      vec2 per = vec2(freq, freq * 0.5);
       vec2 p = vec2(uv.x * freq, uv.y * freq * 0.5) + dir * t;
       const float e = 0.09;
-      float n = pnoise(p, freq);
-      return vec2(pnoise(p + vec2(e, 0.0), freq) - n,
-                  pnoise(p + vec2(0.0, e), freq) - n) / e;
+      float n = pnoise(p, per);
+      return vec2(pnoise(p + vec2(e, 0.0), per) - n,
+                  pnoise(p + vec2(0.0, e), per) - n) / e;
     }
 
     void main() {
@@ -302,8 +318,8 @@ const earthMat = new THREE.ShaderMaterial({
 
       // Roughness drifts with the wind field, which makes the glint sparkle.
       float chop = mix(0.075, 0.155,
-        pnoise(vec2(vUv.x * 256.0 + waveT * 0.6, vUv.y * 128.0), 256.0) * 0.6 +
-        pnoise(vec2(vUv.x * 64.0 - waveT * 0.2, vUv.y * 32.0), 64.0) * 0.4);
+        pnoise(vec2(vUv.x * 256.0 + waveT * 0.6, vUv.y * 128.0), vec2(256.0, 128.0)) * 0.6 +
+        pnoise(vec2(vUv.x * 64.0 - waveT * 0.2, vUv.y * 32.0), vec2(64.0, 32.0)) * 0.4);
 
       vec3  H     = normalize(L + V);
       float NoH   = max(dot(Nb, H), 0.0);
@@ -583,34 +599,91 @@ function sunEphemeris(d, out) {
   const rAU = 1 - e * Math.cos(E);
   _sunUnit.set(Math.cos(lon), 0, -Math.sin(lon));
   out.copy(_sunUnit).multiplyScalar(SUN_DIST);
-  return { rAU, lon };
+  return { rAU, lon, M, meanLon: M + w };
 }
 
 // Geocentric moon. The node regresses on its 18.6-year cycle and perigee
 // advances on its 8.85-year one, which is what spaces the eclipse seasons.
-function moonEphemeris(d, out) {
+// A bare two-body solution is not good enough here: the sun's pull shows up as
+// evection, variation and the yearly equation, worth up to ~1.3° of longitude
+// and several thousand km of range, which is the difference between a correct
+// eclipse magnitude and a wrong one. Truncated Schlyter series below.
+function moonEphemeris(d, out, sunM, sunMeanLon) {
   const L  = (218.3165 + 13.17639648 * d) * DEG;    // mean longitude
   const M  = (134.9634 + 13.06499295 * d) * DEG;    // mean anomaly
   const Om = (125.0445 -  0.05295377 * d) * DEG;    // ascending node
   const w  = L - M - Om;                            // argument of perigee
   const E  = kepler(M, E_MOON);
-  const r  = A_MOON * (1 - E_MOON * Math.cos(E));
+  let   r  = A_MOON * (1 - E_MOON * Math.cos(E));
   const u  = trueAnomaly(E, E_MOON) + w;            // argument of latitude
 
   const ci = Math.cos(I_MOON), si = Math.sin(I_MOON);
   const cu = Math.cos(u), su = Math.sin(u);
-  const x = r * (Math.cos(Om) * cu - Math.sin(Om) * su * ci);
-  const y = r * (Math.sin(Om) * cu + Math.cos(Om) * su * ci);
-  out.set(x, r * su * si, -y);
-  return { r, meanLon: L };
+  const xe = r * (Math.cos(Om) * cu - Math.sin(Om) * su * ci);
+  const ye = r * (Math.sin(Om) * cu + Math.cos(Om) * su * ci);
+  const ze = r * su * si;
+
+  let lon = Math.atan2(ye, xe);
+  let lat = Math.atan2(ze, Math.hypot(xe, ye));
+
+  const D = L - sunMeanLon;          // mean elongation
+  const F = L - Om;                  // argument of latitude
+  const S = Math.sin, C = Math.cos;
+
+  lon += DEG * (
+    -1.274 * S(M - 2*D)              // evection
+    +0.658 * S(2*D)                  // variation
+    -0.186 * S(sunM)                 // yearly equation
+    -0.059 * S(2*M - 2*D)
+    -0.057 * S(M - 2*D + sunM)
+    +0.053 * S(M + 2*D)
+    +0.046 * S(2*D - sunM)
+    +0.041 * S(M - sunM)
+    -0.035 * S(D)                    // parallactic equation
+    -0.031 * S(M + sunM)
+    -0.015 * S(2*F - 2*D)
+    +0.011 * S(M - 4*D)
+  );
+  lat += DEG * (
+    -0.173 * S(F - 2*D)
+    -0.055 * S(M - F - 2*D)
+    -0.046 * S(M + F - 2*D)
+    +0.033 * S(F + 2*D)
+    +0.017 * S(2*M + F)
+  );
+  r += -0.58 * C(M - 2*D) - 0.46 * C(2*D);   // earth radii
+
+  const cl = Math.cos(lat);
+  out.set(r * cl * Math.cos(lon), r * Math.sin(lat), -r * cl * Math.sin(lon));
+  // meanLon stays the UNPERTURBED mean longitude: the moon's rotation locks to
+  // it, and the gap between mean and true is exactly the optical libration.
+  // lon is the perturbed true longitude, used only by the phase readout.
+  return { r, meanLon: L, lon };
+}
+
+// Open looking at the lit hemisphere. A fixed starting position is wrong on
+// most dates — at the timestamp the HUD advertises it lands 165° from the sun,
+// so the page opens on a near-black earth with the eclipse round the back.
+{
+  const d0 = ((t0 ?? Date.now()) - J2000_MS) / 1000 / DAY;
+  sunEphemeris(d0, new THREE.Vector3());            // populates _sunUnit
+  camera.position.copy(_sunUnit).multiplyScalar(3.4)
+        .addScaledVector(new THREE.Vector3(0, 1, 0), 0.8);
+  controls.target.set(0, 0, 0);
 }
 
 // ── simulation ────────────────────────────────────────────────────────────
 // t counts seconds from J2000 and starts at the wall clock, so the phase and
 // the season on screen are the ones outside the window.
-addEventListener('hashchange', () => { state.t = (startMs() - J2000_MS) / 1000; state.paused = true; });
+addEventListener('hashchange', () => {
+  const ms = startMs();
+  if (ms === null) return;                // unparseable: leave the clock alone
+  state.t = (ms - J2000_MS) / 1000;
+  state.paused = true;
+});
 const el = id => document.getElementById(id);
 const prevMoon = new THREE.Vector3();
+const _scratch = new THREE.Vector3();
 
 const fmtRate = r => r >= 86400 ? (r / 86400).toFixed(1) + ' d/s'
   : r >= 3600 ? (r / 3600).toFixed(1) + ' h/s'
@@ -630,19 +703,26 @@ function occultation(p, sunP, sunR, occP, occR) {
   return cov * Math.min(1, (ro * ro) / (rs * rs));
 }
 
+const UP = new THREE.Vector3(0, 1, 0);
+
+// Direction that puts the earth-moon line broadside to the camera. At 3.4x the
+// moon's distance it sits 17.1° off axis, inside the 19° vertical half-FOV, so
+// the framing survives a portrait window; 2.8x put it at 19.9° and only worked
+// because it happened to fall along the wider horizontal axis.
+const systemView = (out) => out
+  .crossVectors(moon.position, UP).normalize()
+  .multiplyScalar(Math.cos(0.42))
+  .addScaledVector(UP, Math.sin(0.42))
+  .normalize();
+
 function setFocus(mode) {
-  state.focus = mode === 'moon' ? 'moon' : 'earth';
+  state.focus = mode;
   controls.minDistance = mode === 'moon' ? R_MOON * 1.2 : 1.05;
 
   if (mode === 'system') {
-    // Look down the perpendicular to the earth-moon line, from far enough out
-    // that both fit — which is the only honest way to show 60 earth radii.
-    const side = new THREE.Vector3()
-      .crossVectors(moon.position, new THREE.Vector3(0, 1, 0)).normalize();
     controls.target.set(0, 0, 0);
-    camera.position.copy(side).multiplyScalar(Math.cos(0.42))
-      .addScaledVector(new THREE.Vector3(0, 1, 0), Math.sin(0.42))
-      .multiplyScalar(moon.position.length() * 2.8);
+    camera.position.copy(systemView(new THREE.Vector3()))
+      .multiplyScalar(moon.position.length() * 3.4);
     return;
   }
 
@@ -660,7 +740,11 @@ addEventListener('keydown', e => {
   if (e.key === '1') setFocus('earth');
   if (e.key === '2') setFocus('system');
   if (e.key === '3') setFocus('moon');
-  if (e.key === 't') state.t = (Date.now() - J2000_MS) / 1000;
+  if (e.key === 't') {
+    state.t = (Date.now() - J2000_MS) / 1000;
+    state.paused = false;                 // "now" should run, not sit frozen
+    history.replaceState(null, '', location.pathname);   // drop the stale hash
+  }
 });
 
 addEventListener('resize', () => {
@@ -679,9 +763,11 @@ renderer.setAnimationLoop(() => {
     waveT.value += dt * Math.min(Math.max(state.rate / 240, 0.6), 24);
   }
 
-  const d = state.t / DAY;                            // days since J2000
-  const s = sunEphemeris(d, sunPos.value);
-  const m = moonEphemeris(d, moonPos.value);
+  // The ephemerides want Terrestrial Time; earth's rotation wants UT1 ≈ UTC.
+  const d   = state.t / DAY;                          // UTC days since J2000
+  const dTT = d + 69.2 / 86400;
+  const s = sunEphemeris(dTT, sunPos.value);
+  const m = moonEphemeris(dTT, moonPos.value, s.M, s.meanLon);
 
   sunDir.copy(_sunUnit);
   sun.position.copy(sunPos.value);
@@ -701,6 +787,13 @@ renderer.setAnimationLoop(() => {
   if (state.focus === 'moon') {
     camera.position.add(moon.position.clone().sub(prevMoon));
     controls.target.copy(moon.position);
+  } else if (state.focus === 'system') {
+    // The moon orbits out of the composition otherwise. Re-derive only the
+    // framing direction and ease onto it, so the user keeps their own zoom and
+    // is not fought for control of the camera every frame.
+    controls.target.set(0, 0, 0);
+    const dist = camera.position.length();
+    camera.position.lerp(systemView(_scratch).multiplyScalar(dist), 0.04);
   }
   prevMoon.copy(moon.position);
 
@@ -710,11 +803,21 @@ renderer.setAnimationLoop(() => {
   el('date').textContent = new Date(J2000_MS + state.t * 1000)
     .toISOString().slice(0, 16).replace('T', ' ');
   el('rate').textContent = state.paused ? 'paused' : fmtRate(state.rate);
+  // Nothing else says the sim started frozen on a #timestamp.
+  el('rate').style.color = state.paused ? '#e8a33d' : '';
 
   const toSun = sunPos.value.clone().sub(moonPos.value).normalize();
   const toEarth = moonPos.value.clone().negate().normalize();
   const illum = 0.5 * (1 + toSun.dot(toEarth));
-  let elong = (m.meanLon - s.lon) % TAU;
+  // Elongation from the actual positions. Mixing the moon's MEAN longitude with
+  // the sun's TRUE one let the equation of centre (±6.3°) drift the phase name
+  // out of step with illum, printing things like "first quarter 56%". The cross
+  // product's Y component recovers the waxing/waning sign.
+  const mHat = moonPos.value.clone().normalize();
+  let elong = Math.atan2(
+    new THREE.Vector3().crossVectors(_sunUnit, mHat).y,
+    _sunUnit.dot(mHat)
+  );
   if (elong < 0) elong += TAU;
   el('phase').textContent =
     PHASES[Math.round(elong / TAU * 8) % 8] + ' ' + (illum * 100).toFixed(0) + '%';
