@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Earth — three.js</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; }
+  #hud, #load {
+    position: fixed;
+    font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: #7f8c9b; user-select: none; pointer-events: none;
+  }
+  #hud { left: 16px; bottom: 14px; }
+  #hud b { color: #cfd8e3; font-weight: 500; }
+  #hud i { color: #e8a33d; font-style: normal; }
+  #load { left: 50%; top: 50%; transform: translate(-50%, -50%); color: #46525f; }
+  #load code { color: #cfd8e3; }
+</style>
+</head>
+<body>
+<div id="load">loading textures…</div>
+<div id="hud">
+  drag <b>orbit</b> · scroll <b>zoom</b> · <b>space</b> pause · <b>[ ]</b> time scale · <b>c</b> clouds<br>
+  <b>1</b> earth · <b>2</b> earth–moon · <b>3</b> follow moon · <b>t</b> now · url <b>#2027-08-02T10:07</b><br>
+  <b id="date">—</b> UTC · <b id="rate">1×</b><br>
+  moon <b id="phase">—</b> · <b id="dist">—</b><span id="ecl"></span>
+</div>
+
+<!-- ES modules cannot be imported over file://, so say so plainly rather than
+     leaving a blank page and a console error nobody was looking at. -->
+<script>
+  if (location.protocol === 'file:') {
+    document.getElementById('load').innerHTML =
+      'this build is split across modules, which browsers refuse to load over file://<br><br>' +
+      'serve the folder instead:<br><code>python3 -m http.server 8000</code><br>' +
+      'then open <code>http://localhost:8000/</code>';
+  }
+</script>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.185.1/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.1/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="./main.js"></script>
+</body>
+</html>
